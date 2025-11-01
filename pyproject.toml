@@ -1,0 +1,18 @@
+[project]
+name = "Crypto-price-agent-a2a"
+version = "0.1.0"
+description = "A crypto price getting agent with A2A protocol support"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.95.0",
+    "uvicorn[standard]>=0.22.0",
+    "httpx>=0.24.0",
+    "pydantic>=1.10.0",
+    "cachetools>=5.3.0",
+    "python-dotenv>=1.0.0",
+    "pytest>=7.0.0"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

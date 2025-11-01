@@ -1,0 +1,6 @@
+pyproject.toml
+Crypto_price_agent_a2a.egg-info/PKG-INFO
+Crypto_price_agent_a2a.egg-info/SOURCES.txt
+Crypto_price_agent_a2a.egg-info/dependency_links.txt
+Crypto_price_agent_a2a.egg-info/requires.txt
+Crypto_price_agent_a2a.egg-info/top_level.txt
