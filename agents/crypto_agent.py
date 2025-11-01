@@ -1,7 +1,9 @@
 # agents/crypto_agent.py
 from coingecko_sdk import AsyncCoingecko
+from groq import Groq
 from uuid import uuid4
 from typing import List, Optional, Dict, Any
+import json
 
 from models.a2a import (
     A2AMessage, TaskResult, TaskStatus, Artifact,
