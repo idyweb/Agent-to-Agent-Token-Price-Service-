@@ -1,0 +1,36 @@
+{
+  "active": true,
+  "category": "utilities",
+  "description": "Get real-time cryptocurrency prices and market information for Bitcoin, Ethereum, Solana, and 100+ other cryptocurrencies.",
+  "id": "sonia",
+  "long_description": "Sonia is a cryptocurrency price assistant that provides real-time market data from CoinGecko. Ask about specific coin prices (e.g., 'What's the price of Bitcoin?'), compare multiple cryptocurrencies, or get general crypto market information. Supports major cryptocurrencies including BTC, ETH, SOL, ADA, BNB, and many more. Prices are available in multiple currencies including USD, EUR, GBP, JPY, CAD, and AUD.",
+  "name": "Sonia",
+  "nodes": [
+    {
+      "id": "crypto_agent",
+      "name": "Crypto Price Agent",
+      "parameters": {
+        "description": "Fetches real-time cryptocurrency prices using CoinGecko API",
+        "capabilities": [
+          "get_single_price",
+          "compare_prices",
+          "answer_crypto_questions"
+        ]
+      },
+      "position": [
+        816,
+        -112
+      ],
+      "type": "a2a/generic-a2a-node",
+      "typeVersion": 1,
+      "url": "https://6817a6927ca4.ngrok-free.app/a2a/price"
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "short_description": "Real-time cryptocurrency prices and market data",
+  "tags": ["crypto", "cryptocurrency", "bitcoin", "ethereum", "prices", "market-data"],
+  "version": "1.0.0"
+}
