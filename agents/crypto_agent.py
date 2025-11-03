@@ -1,570 +1,657 @@
 from coingecko_sdk import AsyncCoingecko
-from groq import Groq
 from uuid import uuid4
-from typing import List, Optional, Dict, Any
-import json
+from typing import List, Dict, Any, Optional
 import re
-import os
+from datetime import datetime
 
 from models.a2a import (
     A2AMessage, TaskResult, TaskStatus, Artifact,
-    MessagePart, MessageConfiguration
+    MessagePart
 )
+from llm.llm_service import LLMService
+
 
 class CryptoAgent:
-    def __init__(self, demo_api_key: str = None, pro_api_key: str = None, 
-                 environment: str = "demo", groq_api_key: str = None):
-        """
-        Initialize CryptoAgent with AsyncCoingecko SDK and Groq LLM
-        
-        Args:
-            demo_api_key: CoinGecko Demo API key
-            pro_api_key: CoinGecko Pro API key
-            environment: "demo" or "pro"
-            groq_api_key: Groq API key for LLM
-        """
-        # Initialize AsyncCoingecko client
+    """
+    Handles all cryptocurrency-related operations such as:
+    - Fetching coin prices
+    - Market data and rankings
+    - Historical data and charts
+    - Coin metadata and tickers
+    - Categories and trending coins
+    Each result is passed through an LLM to provide a conversational response.
+    """
+
+    def __init__(self, demo_api_key=None, pro_api_key=None, environment="demo", groq_api_key=None):
+        # Initialize CoinGecko client
         if environment == "pro" and pro_api_key:
             self.client = AsyncCoingecko(pro_api_key=pro_api_key, environment="pro")
         elif environment == "demo" and demo_api_key:
             self.client = AsyncCoingecko(demo_api_key=demo_api_key, environment="demo")
         else:
             self.client = AsyncCoingecko()
-        
-        # Initialize Groq client
-        self.groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
-        
-        self.price_history = {}
-        self.conversation_history = {}
 
-    async def process_messages(
-    self,
-    messages: List[A2AMessage],
-    context_id: Optional[str] = None,
-    task_id: Optional[str] = None,
-    config: Optional[MessageConfiguration] = None
-) -> TaskResult:
-        """Process incoming messages using LLM for intent detection"""
+        # Initialize LLM service
+        self.llm = LLMService(api_key=groq_api_key)
 
+        # Context tracking
+        self.price_history: Dict[str, list] = {}
+        self.conversation_history: Dict[str, list] = {}
+
+   
+    # message handler
+    
+    async def process_messages(self, messages: List[A2AMessage], context_id=None, task_id=None, config=None) -> TaskResult:
         context_id = context_id or str(uuid4())
         task_id = task_id or str(uuid4())
-
         user_message = messages[-1] if messages else None
         if not user_message:
             raise ValueError("No message provided")
 
-        message_text = None
- 
-        # Strategy 1: Try to find non-empty text in text parts
+        message_text = self._extract_message_text(user_message)
+        print(f"Processing user query: '{message_text}'")
+
+        # Analyze user intent with LLM
+        intent_data = await self.llm.analyze_intent(message_text, context_id)
+        print(f"Intent detected: {intent_data}")
+
+        # Only ask for clarification if we truly need more info AND there's no coin_id
+        intent = intent_data.get("intent", "get_price")
+        coin_id = intent_data.get("coin_id")
+        needs_info = intent_data.get("needs_info", False)
+        
+        # only clarify if no coin AND intent requires a coin
+        requires_coin = intent in ["get_price", "coin_info", "historical_data"]
+        if needs_info and requires_coin and not coin_id:
+            return self._create_clarification_response(messages, context_id, task_id)
+
+        # Route to appropriate handler
+        if intent == "get_price":
+            return await self._handle_price_query(messages, context_id, task_id, intent_data, message_text)
+        elif intent == "compare_prices":
+            return await self._handle_comparison(messages, context_id, task_id, intent_data, message_text)
+        elif intent == "market_data":
+            return await self._handle_market_data(messages, context_id, task_id, intent_data, message_text)
+        elif intent == "coin_info":
+            return await self._handle_coin_info(messages, context_id, task_id, intent_data, message_text)
+        elif intent == "historical_data":
+            return await self._handle_historical_data(messages, context_id, task_id, intent_data, message_text)
+        elif intent == "categories":
+            return await self._handle_categories(messages, context_id, task_id, intent_data, message_text)
+        elif intent == "general_question":
+            return await self._handle_general_question(messages, context_id, task_id, message_text)
+        else:
+            return self._create_clarification_response(messages, context_id, task_id)
+
+    # ------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------
+    def _extract_message_text(self, user_message: A2AMessage) -> str:
+        """Extracts plain text from A2AMessage parts."""
         for part in user_message.parts:
             if part.kind == "text" and part.text:
-                text = part.text.strip()
-                text = re.sub(r'<[^>]+>', '', text)  # Remove HTML
-                text = text.strip()
-                
-                if text:  # Found non-empty text
-                    message_text = text
-                    print(f"✅ Found text in text part: '{message_text}'")
-                    break
-        
-        # Strategy 2: If no valid text found, look in data parts
-        if not message_text:
-            print(f"⚠️  No valid text in text parts, checking data parts...")
-            
-            for part in user_message.parts:
-                if part.kind == "data" and part.data:
-                    # The data might be a list of message objects
-                    if isinstance(part.data, list) and len(part.data) > 0:
-                        # Get the LAST item (most recent message)
-                        last_item = part.data[-1]
-                        
-                        if isinstance(last_item, dict) and last_item.get("kind") == "text":
-                            text = last_item.get("text", "")
-                            text = text.strip()
-                            text = re.sub(r'<[^>]+>', '', text)
-                            text = text.strip()
-                            
-                            if text:
-                                message_text = text
-                                print(f"✅ Found text in data part (last item): '{message_text}'")
-                                break
-        
-        if not message_text:
-            raise ValueError("No text content in message")
+                return re.sub(r"<[^>]+>", "", part.text.strip())
+        raise ValueError("No valid text found in message.")
 
-        print(f"📝 Processing user query: '{message_text}'")
+    async def _compose_llm_response(self, user_query: str, data_summary: str, context: str = "") -> str:
+        """
+        Passes the factual data through the LLM to create a natural, conversational response.
+        """
+        prompt = (
+            f"User asked: '{user_query}'.\n"
+            f"Here is the factual data retrieved:\n{data_summary}\n\n"
+            f"Context: {context}\n"
+            f"Now respond conversationally — be clear, factual, and helpful. "
+            f"If possible, include relevant insights or advice."
+        )
+        return await self.llm.generate(prompt)
 
-        # Use LLM to understand intent
-        if self.groq_client:
-            print(f"🤖 Analyzing with LLM...")
-            intent_data = await self._analyze_with_llm(message_text, context_id)
-            print(f"🎯 Intent: {intent_data.get('intent')}, Coin: {intent_data.get('coin_id')}")
-        else:
-            coin_id, currency = self._parse_message(message_text)
-            intent_data = {
-                "intent": "get_price",
-                "coin_id": coin_id,
-                "currency": currency,
-                "needs_info": coin_id is None
-            }
-
-        # Handle different intents
-        if intent_data.get("needs_info"):
-            return self._create_clarification_response(
-                messages, context_id, task_id, intent_data
-            )
-
-        intent = intent_data.get("intent", "get_price")
-        
-        if intent == "get_price":
-            return await self._handle_price_query(
-                messages, context_id, task_id, intent_data, message_text
-            )
-        elif intent == "compare_prices":
-            return await self._handle_comparison(
-                messages, context_id, task_id, intent_data, message_text
-            )
-        elif intent == "general_question":
-            return await self._handle_general_question(
-                messages, context_id, task_id, message_text
-            )
-        else:
-            return await self._handle_price_query(
-                messages, context_id, task_id, intent_data, message_text
-            )
-
-
-    async def _analyze_with_llm(self, message: str, context_id: str) -> Dict[str, Any]:
-        """Use Groq LLM to analyze user message and extract intent"""
-        
-        # Build conversation context
-        if context_id not in self.conversation_history:
-            self.conversation_history[context_id] = []
-        
-        # System prompt for the LLM
-        system_prompt = """You are a cryptocurrency assistant. Analyze the user's message and extract:
-1. intent: 
-   - "get_price" for asking about ONE specific coin (even if multiple mentioned, use the LAST one)
-   - "compare_prices" ONLY if user explicitly asks to "compare" multiple coins
-   - "general_question" for other crypto questions
-2. coin_id: CoinGecko ID of the cryptocurrency (for get_price)
-3. coin_ids: Array of coin IDs (ONLY for compare_prices)
-4. currency: preferred currency (default: usd)
-5. needs_info: true if you cannot identify a specific coin
-
-Supported coins:
-- bitcoin/btc -> bitcoin
-- ethereum/eth -> ethereum  
-- solana/sol -> solana
-- binance/bnb -> binancecoin
-- cardano/ada -> cardano
-
-IMPORTANT RULES:
-- If user mentions multiple coins without the word "compare", use "get_price" with the LAST coin mentioned
-- Only use "compare_prices" if user explicitly says "compare X and Y" or similar
-- Examples:
-  * "bitcoin solana bnb" -> {"intent": "get_price", "coin_id": "binancecoin"} (last coin)
-  * "what's the price of bnb?" -> {"intent": "get_price", "coin_id": "binancecoin"}
-  * "compare bitcoin and solana" -> {"intent": "compare_prices", "coin_ids": ["bitcoin", "solana"]}
-
-Return ONLY a valid JSON object."""
-
+    
+    # CoinGecko API Methods 
+    
+    
+    async def get_price(self, coin_id: str, currency: str = "usd") -> Optional[float]:
+        """Fetch live price from CoinGecko API."""
         try:
-            response = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message}
-                ],
-                temperature=0.1,
-                max_tokens=500,
-                response_format={"type": "json_object"}
-            )
-            
-            result = json.loads(response.choices[0].message.content)
-            return result
-            
+            data = await self.client.simple.price.get(vs_currencies=currency, ids=coin_id)
+            if coin_id in data and hasattr(data[coin_id], currency):
+                return getattr(data[coin_id], currency)
         except Exception as e:
-            print(f"LLM analysis error: {e}")
-            # Fallback to simple parsing
-            coin_id, currency = self._parse_message(message)
-            return {
-                "intent": "get_price",
-                "coin_id": coin_id,
-                "currency": currency,
-                "needs_info": coin_id is None
-            }
+            print(f"Error fetching price: {e}")
+        return None
 
-    async def _handle_price_query(
-        self, messages: List[A2AMessage], context_id: str, 
-        task_id: str, intent_data: Dict, original_message: str
-    ) -> TaskResult:
-        """Handle single price query"""
-        
+    async def get_supported_currencies(self) -> Optional[List[str]]:
+        """Query all supported currencies on CoinGecko."""
+        try:
+            currencies = await self.client.simple.supported_vs_currencies.get()
+            return list(currencies) if currencies else None
+        except Exception as e:
+            print(f"Error fetching supported currencies: {e}")
+        return None
+
+    async def get_coins_list(self, include_platform: bool = False) -> Optional[List[Dict]]:
+        """Query all supported coins with ID, name, and symbol."""
+        try:
+            coins = await self.client.coins.list.get(include_platform=include_platform)
+            return [{"id": c.id, "symbol": c.symbol, "name": c.name} for c in coins] if coins else None
+        except Exception as e:
+            print(f"Error fetching coins list: {e}")
+        return None
+
+    async def get_markets(self, currency: str = "usd", per_page: int = 10, page: int = 1, 
+                         order: str = "market_cap_desc") -> Optional[List[Dict]]:
+        """Query coins with price, market cap, volume, and market data."""
+        try:
+            markets = await self.client.coins.markets.get(
+                vs_currency=currency,
+                per_page=per_page,
+                page=page,
+                order=order
+            )
+            if not markets:
+                return None
+            
+            return [{
+                "id": m.id,
+                "symbol": m.symbol,
+                "name": m.name,
+                "current_price": getattr(m, 'current_price', None),
+                "market_cap": getattr(m, 'market_cap', None),
+                "total_volume": getattr(m, 'total_volume', None),
+                "price_change_24h": getattr(m, 'price_change_24h', None),
+                "price_change_percentage_24h": getattr(m, 'price_change_percentage_24h', None),
+                "market_cap_rank": getattr(m, 'market_cap_rank', None)
+            } for m in markets]
+        except Exception as e:
+            print(f"Error fetching markets: {e}")
+        return None
+
+    async def get_coin_details(self, coin_id: str, localization: bool = False, 
+                              tickers: bool = False, market_data: bool = True) -> Optional[Dict]:
+        """Query all metadata for a coin (image, websites, description, etc.)."""
+        try:
+            coin = await self.client.coins.get(
+                id=coin_id,
+                localization=localization,
+                tickers=tickers,
+                market_data=market_data
+            )
+            if not coin:
+                return None
+            
+            return {
+                "id": coin.id,
+                "symbol": getattr(coin, 'symbol', None),
+                "name": getattr(coin, 'name', None),
+                "description": getattr(coin, 'description', {}).get('en', '') if hasattr(coin, 'description') else '',
+                "image": getattr(coin, 'image', {}).__dict__ if hasattr(coin, 'image') else {},
+                "market_cap_rank": getattr(coin, 'market_cap_rank', None),
+                "links": getattr(coin, 'links', {}).__dict__ if hasattr(coin, 'links') else {},
+                "market_data": getattr(coin, 'market_data', {}).__dict__ if hasattr(coin, 'market_data') else {}
+            }
+        except Exception as e:
+            print(f"Error fetching coin details: {e}")
+        return None
+
+    async def get_coin_tickers(self, coin_id: str, exchange_ids: str = None, 
+                              page: int = 1) -> Optional[Dict]:
+        """Query coin tickers on both CEX and DEX."""
+        try:
+            tickers = await self.client.coins.tickers.get(
+                id=coin_id,
+                exchange_ids=exchange_ids,
+                page=page
+            )
+            if not tickers:
+                return None
+            
+            return {
+                "name": getattr(tickers, 'name', None),
+                "tickers": [
+                    {
+                        "base": t.base,
+                        "target": t.target,
+                        "market": getattr(t, 'market', {}).name if hasattr(t, 'market') else None,
+                        "last": getattr(t, 'last', None),
+                        "volume": getattr(t, 'volume', None)
+                    } for t in getattr(tickers, 'tickers', [])
+                ]
+            }
+        except Exception as e:
+            print(f"Error fetching tickers: {e}")
+        return None
+
+    async def get_coin_history(self, coin_id: str, date: str) -> Optional[Dict]:
+        """Query historical data at a given date (format: DD-MM-YYYY)."""
+        try:
+            history = await self.client.coins.history.get(id=coin_id, date=date)
+            if not history:
+                return None
+            
+            return {
+                "id": history.id,
+                "symbol": getattr(history, 'symbol', None),
+                "name": getattr(history, 'name', None),
+                "market_data": getattr(history, 'market_data', {}).__dict__ if hasattr(history, 'market_data') else {}
+            }
+        except Exception as e:
+            print(f"Error fetching coin history: {e}")
+        return None
+
+    async def get_market_chart(self, coin_id: str, currency: str = "usd", 
+                              days: str = "7") -> Optional[Dict]:
+        """Get historical chart data (price, market cap, volume)."""
+        try:
+            chart = await self.client.coins.market_chart.get(
+                id=coin_id,
+                vs_currency=currency,
+                days=days
+            )
+            if not chart:
+                return None
+            
+            return {
+                "prices": getattr(chart, 'prices', []),
+                "market_caps": getattr(chart, 'market_caps', []),
+                "total_volumes": getattr(chart, 'total_volumes', [])
+            }
+        except Exception as e:
+            print(f"Error fetching market chart: {e}")
+        return None
+
+    async def get_market_chart_range(self, coin_id: str, currency: str = "usd", 
+                                    from_timestamp: int = None, to_timestamp: int = None) -> Optional[Dict]:
+        """Get historical chart data within a time range (UNIX timestamps)."""
+        try:
+            chart = await self.client.coins.market_chart_range.get(
+                id=coin_id,
+                vs_currency=currency,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp
+            )
+            if not chart:
+                return None
+            
+            return {
+                "prices": getattr(chart, 'prices', []),
+                "market_caps": getattr(chart, 'market_caps', []),
+                "total_volumes": getattr(chart, 'total_volumes', [])
+            }
+        except Exception as e:
+            print(f"Error fetching market chart range: {e}")
+        return None
+
+    async def get_ohlc(self, coin_id: str, currency: str = "usd", days: str = "7") -> Optional[List]:
+        """Get OHLC chart data (Open, High, Low, Close)."""
+        try:
+            ohlc = await self.client.coins.ohlc.get(
+                id=coin_id,
+                vs_currency=currency,
+                days=days
+            )
+            return list(ohlc) if ohlc else None
+        except Exception as e:
+            print(f"Error fetching OHLC: {e}")
+        return None
+
+    async def get_categories_list(self) -> Optional[List[Dict]]:
+        """Query all coin categories."""
+        try:
+            categories = await self.client.coins.categories.list.get()
+            return [{"id": c.category_id, "name": c.name} for c in categories] if categories else None
+        except Exception as e:
+            print(f"Error fetching categories list: {e}")
+        return None
+
+    async def get_categories(self, order: str = "market_cap_desc") -> Optional[List[Dict]]:
+        """Query all categories with market data."""
+        try:
+            categories = await self.client.coins.categories.get(order=order)
+            if not categories:
+                return None
+            
+            return [{
+                "id": c.id,
+                "name": c.name,
+                "market_cap": getattr(c, 'market_cap', None),
+                "volume_24h": getattr(c, 'volume_24h', None),
+                "market_cap_change_24h": getattr(c, 'market_cap_change_24h', None)
+            } for c in categories]
+        except Exception as e:
+            print(f"Error fetching categories: {e}")
+        return None
+
+    async def get_coin_trend(self, coin_id: str, currency: str = "usd") -> Optional[Dict]:
+        """Get current trend data including price and 24h change for a specific coin."""
+        try:
+            # Use markets endpoint to get trend data
+            markets = await self.get_markets(currency=currency, per_page=250)
+            if not markets:
+                return None
+            
+            # Find the specific coin
+            coin_data = next((m for m in markets if m['id'] == coin_id), None)
+            return coin_data
+        except Exception as e:
+            print(f"Error fetching coin trend: {e}")
+        return None
+
+    
+    # Intent Handlers
+    
+    
+    async def _handle_price_query(self, messages, context_id, task_id, intent_data, original_message):
         coin_id = intent_data.get("coin_id")
         currency = intent_data.get("currency", "usd")
 
         try:
             price = await self.get_price(coin_id, currency)
-            
             if price is None:
                 raise ValueError(f"No price data available for {coin_id}")
 
-            # Store in history
-            if context_id not in self.price_history:
-                self.price_history[context_id] = []
-            self.price_history[context_id].append({
-                "coin": coin_id,
-                "price": price,
-                "currency": currency,
-                "timestamp": task_id
+            self.price_history.setdefault(context_id, []).append({
+                "coin": coin_id, "currency": currency, "price": price
             })
 
-            # Generate natural response with LLM
-            if self.groq_client:
-                print(f"✨ Generating natural response with LLM")
-                response_text = await self._generate_llm_response(
-                    original_message, coin_id, price, currency, context_id
-                )
-            else:
-                print(f"📝 Using template response")
-                response_text = (
-                    f"The current price of {coin_id.title()} is "
-                    f"{currency.upper()} {price:,.2f}"
-                )
+            data_summary = f"Coin: {coin_id}\nCurrency: {currency.upper()}\nPrice: {price:,.2f}"
+            response_text = await self._compose_llm_response(original_message, data_summary)
 
-            response_message = A2AMessage(
-                role="agent",
-                parts=[MessagePart(kind="text", text=response_text)],
-                taskId=task_id,
-                metadata={
-                    "method": "llm" if self.groq_client else "fallback",
-                    "model": "llama-3.3-70b-versatile" if self.groq_client else None
-                }
-            )
-
-            artifacts = [
-                Artifact(
-                    name="price",
-                    parts=[MessagePart(kind="text", text=f"{price}")]
-                ),
-                Artifact(
-                    name="coin_info",
-                    parts=[MessagePart(
-                        kind="text",
-                        text=f"Coin: {coin_id}\nCurrency: {currency.upper()}\nPrice: {price:,.2f}"
-                    )]
-                )
-            ]
-
-            return TaskResult(
-                id=task_id,
-                contextId=context_id,
-                status=TaskStatus(state="completed", message=response_message),
-                artifacts=artifacts,
-                history=messages + [response_message]
-            )
-
-        except Exception as e:
-            response_text = f"Error fetching price for {coin_id}: {str(e)}"
             response_message = A2AMessage(
                 role="agent",
                 parts=[MessagePart(kind="text", text=response_text)],
                 taskId=task_id
             )
 
+            artifacts = [
+                Artifact(
+                    name="price_data", 
+                    parts=[
+                        MessagePart(kind="text", text=response_text),
+                        MessagePart(
+                            kind="data", 
+                            data={
+                                "coin": coin_id,
+                                "currency": currency,
+                                "price": price
+                            }
+                        )
+                    ]
+                )
+            ]
+
             return TaskResult(
                 id=task_id,
                 contextId=context_id,
-                status=TaskStatus(state="failed", message=response_message),
-                artifacts=[],
+                status=TaskStatus(state="completed"),
+                artifacts=artifacts,
                 history=messages + [response_message]
             )
 
-    async def _handle_comparison(
-        self, messages: List[A2AMessage], context_id: str, 
-        task_id: str, intent_data: Dict, original_message: str
-    ) -> TaskResult:
-        """Handle comparison of multiple coins"""
-        
+        except Exception as e:
+            return self._error_result(messages, context_id, task_id, f"Error fetching price: {str(e)}")
+
+    async def _handle_comparison(self, messages, context_id, task_id, intent_data, original_message):
         coin_ids = intent_data.get("coin_ids", [])
         currency = intent_data.get("currency", "usd")
-        
-        if not coin_ids or len(coin_ids) < 2:
-            coin_ids = self._extract_multiple_coins(original_message)
 
         try:
             prices = {}
-            for coin_id in coin_ids:
-                price = await self.get_price(coin_id, currency)
-                if price:
-                    prices[coin_id] = price
+            for coin in coin_ids:
+                p = await self.get_price(coin, currency)
+                if p:
+                    prices[coin] = p
 
             if not prices:
-                raise ValueError("Could not fetch prices for comparison")
+                raise ValueError("No valid price data for comparison.")
 
-            # Generate comparison with LLM
-            if self.groq_client:
-                response_text = await self._generate_comparison_response(
-                    prices, currency, context_id
-                )
-            else:
-                response_text = "Price Comparison:\n"
-                for coin, price in prices.items():
-                    response_text += f"- {coin.title()}: {currency.upper()} {price:,.2f}\n"
+            summary_lines = [f"{coin}: {currency.upper()} {price:,.2f}" for coin, price in prices.items()]
+            data_summary = "\n".join(summary_lines)
+            response_text = await self._compose_llm_response(original_message, data_summary)
 
-            response_message = A2AMessage(
-                role="agent",
-                parts=[MessagePart(kind="text", text=response_text)],
-                taskId=task_id
+            response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=response_text)], taskId=task_id)
+            artifacts = [Artifact(name="comparison", parts=[MessagePart(kind="data", data=prices)])]
+
+            return TaskResult(
+                id=task_id,
+                contextId=context_id,
+                status=TaskStatus(state="completed"),
+                artifacts=artifacts,
+                history=messages + [response_message]
             )
 
+        except Exception as e:
+            return self._error_result(messages, context_id, task_id, f"Error comparing prices: {str(e)}")
+
+    async def _handle_market_data(self, messages, context_id, task_id, intent_data, original_message):
+        """Handle requests for market data and rankings."""
+        try:
+            per_page = intent_data.get("limit", 10)
+            currency = intent_data.get("currency", "usd")
+            
+            markets = await self.get_markets(currency=currency, per_page=per_page)
+            if not markets:
+                raise ValueError("No market data available")
+
+            data_summary = "Top Cryptocurrencies by Market Cap:\n"
+            for m in markets[:10]:
+                data_summary += f"{m['name']} ({m['symbol'].upper()}): {currency.upper()} {m['current_price']:,.2f} | Market Cap: ${m['market_cap']:,.0f}\n"
+
+            response_text = await self._compose_llm_response(original_message, data_summary)
+            response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=response_text)], taskId=task_id)
+            
             artifacts = [
                 Artifact(
-                    name="comparison",
-                    parts=[MessagePart(kind="data", data=prices)]
+                    name="market_data", 
+                    parts=[
+                        MessagePart(kind="text", text=response_text),
+                        MessagePart(kind="data", data=markets)
+                    ]
                 )
             ]
 
             return TaskResult(
                 id=task_id,
                 contextId=context_id,
-                status=TaskStatus(state="completed", message=response_message),
+                status=TaskStatus(state="completed"),
                 artifacts=artifacts,
                 history=messages + [response_message]
             )
 
         except Exception as e:
-            response_text = f"Error comparing prices: {str(e)}"
-            response_message = A2AMessage(
-                role="agent",
-                parts=[MessagePart(kind="text", text=response_text)],
-                taskId=task_id
-            )
+            return self._error_result(messages, context_id, task_id, f"Error fetching market data: {str(e)}")
+
+    async def _handle_coin_info(self, messages, context_id, task_id, intent_data, original_message):
+        """Handle requests for detailed coin information."""
+        coin_id = intent_data.get("coin_id")
+        
+        try:
+            details = await self.get_coin_details(coin_id)
+            if not details:
+                raise ValueError(f"No details available for {coin_id}")
+
+            data_summary = f"Coin: {details['name']} ({details['symbol'].upper()})\n"
+            data_summary += f"Rank: #{details['market_cap_rank']}\n"
+            
+            # Add description snippet
+            desc = details.get('description', '')[:300]
+            if desc:
+                data_summary += f"Description: {desc}...\n"
+
+            response_text = await self._compose_llm_response(original_message, data_summary)
+            response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=response_text)], taskId=task_id)
+            
+            artifacts = [
+                Artifact(
+                    name="coin_info", 
+                    parts=[
+                        MessagePart(kind="text", text=response_text),
+                        MessagePart(kind="data", data=details)
+                    ]
+                )
+            ]
 
             return TaskResult(
                 id=task_id,
                 contextId=context_id,
-                status=TaskStatus(state="completed", message=response_message),
-                artifacts=[],
+                status=TaskStatus(state="completed"),
+                artifacts=artifacts,
                 history=messages + [response_message]
             )
 
-    async def _handle_general_question(
-        self, messages: List[A2AMessage], context_id: str, 
-        task_id: str, message_text: str
-    ) -> TaskResult:
-        """Handle general cryptocurrency questions"""
-        
-        if not self.groq_client:
-            response_text = "I can help you with cryptocurrency prices. Please ask about a specific coin."
-        else:
-            try:
-                # Get context from price history
-                context = ""
-                if context_id in self.price_history:
-                    recent = self.price_history[context_id][-3:]
-                    context = "Recent queries: " + ", ".join([
-                        f"{p['coin']}: {p['currency'].upper()} {p['price']}" 
-                        for p in recent
-                    ])
+        except Exception as e:
+            return self._error_result(messages, context_id, task_id, f"Error fetching coin info: {str(e)}")
 
-                response = self.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {
-                            "role": "system", 
-                            "content": f"You are a helpful cryptocurrency assistant. {context}"
-                        },
-                        {"role": "user", "content": message_text}
-                    ],
-                    temperature=0.7,
-                    max_tokens=1000
+    async def _handle_historical_data(self, messages, context_id, task_id, intent_data, original_message):
+        """Handle requests for historical price data and trends."""
+        coin_id = intent_data.get("coin_id")
+        days = intent_data.get("days", "1")  # Default to 1 day for trend queries
+        currency = intent_data.get("currency", "usd")
+        
+        try:
+            # Get market data for current price and 24h change
+            markets = await self.get_markets(currency=currency, per_page=250)
+            coin_market_data = None
+            if markets:
+                coin_market_data = next((m for m in markets if m['id'] == coin_id), None)
+            
+            # Get historical chart data
+            chart_data = await self.get_market_chart(coin_id, currency, days)
+            
+            if not coin_market_data and not chart_data:
+                raise ValueError(f"No data available for {coin_id}")
+
+            data_summary = f"Trend analysis for {coin_id}:\n"
+            
+            # Add current market data if available
+            if coin_market_data:
+                data_summary += f"Current Price: {currency.upper()} {coin_market_data['current_price']:,.2f}\n"
+                if coin_market_data['price_change_24h']:
+                    data_summary += f"24h Change: {currency.upper()} {coin_market_data['price_change_24h']:,.2f}\n"
+                if coin_market_data['price_change_percentage_24h']:
+                    change_pct = coin_market_data['price_change_percentage_24h']
+                    trend_direction = "📈 UP" if change_pct > 0 else "📉 DOWN" if change_pct < 0 else "➡️ STABLE"
+                    data_summary += f"24h Change %: {change_pct:.2f}% {trend_direction}\n"
+                if coin_market_data['market_cap']:
+                    data_summary += f"Market Cap: ${coin_market_data['market_cap']:,.0f}\n"
+                if coin_market_data['total_volume']:
+                    data_summary += f"24h Volume: ${coin_market_data['total_volume']:,.0f}\n"
+            
+            # Add historical price data if available
+            if chart_data and chart_data.get('prices'):
+                prices = chart_data['prices']
+                data_summary += f"\nHistorical data ({days} day(s)):\n"
+                if len(prices) >= 2:
+                    start_price = prices[0][1]
+                    end_price = prices[-1][1]
+                    price_change = end_price - start_price
+                    price_change_pct = (price_change / start_price) * 100
+                    data_summary += f"Starting price: {currency.upper()} {start_price:,.2f}\n"
+                    data_summary += f"Current price: {currency.upper()} {end_price:,.2f}\n"
+                    data_summary += f"Change: {currency.upper()} {price_change:,.2f} ({price_change_pct:+.2f}%)\n"
+
+            response_text = await self._compose_llm_response(original_message, data_summary)
+            response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=response_text)], taskId=task_id)
+            
+            artifacts = [
+                Artifact(
+                    name="trend_data", 
+                    parts=[
+                        MessagePart(kind="text", text=response_text),
+                        MessagePart(kind="data", data={
+                            "market_data": coin_market_data,
+                            "chart_data": chart_data
+                        })
+                    ]
                 )
-                
-                response_text = response.choices[0].message.content
-                
-            except Exception as e:
-                response_text = f"I'm here to help with crypto prices. What would you like to know?"
+            ]
 
-        response_message = A2AMessage(
-            role="agent",
-            parts=[MessagePart(kind="text", text=response_text)],
-            taskId=task_id
-        )
+            return TaskResult(
+                id=task_id,
+                contextId=context_id,
+                status=TaskStatus(state="completed"),
+                artifacts=artifacts,
+                history=messages + [response_message]
+            )
+
+        except Exception as e:
+            return self._error_result(messages, context_id, task_id, f"Error fetching trend data: {str(e)}")
+
+    async def _handle_categories(self, messages, context_id, task_id, intent_data, original_message):
+        """Handle requests for cryptocurrency categories."""
+        try:
+            categories = await self.get_categories()
+            if not categories:
+                raise ValueError("No categories data available")
+
+            data_summary = "Top Cryptocurrency Categories:\n"
+            for cat in categories[:10]:
+                data_summary += f"{cat['name']}: Market Cap ${cat['market_cap']:,.0f}\n"
+
+            response_text = await self._compose_llm_response(original_message, data_summary)
+            response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=response_text)], taskId=task_id)
+            
+            artifacts = [
+                Artifact(
+                    name="categories", 
+                    parts=[
+                        MessagePart(kind="text", text=response_text),
+                        MessagePart(kind="data", data=categories)
+                    ]
+                )
+            ]
+
+            return TaskResult(
+                id=task_id,
+                contextId=context_id,
+                status=TaskStatus(state="completed"),
+                artifacts=artifacts,
+                history=messages + [response_message]
+            )
+
+        except Exception as e:
+            return self._error_result(messages, context_id, task_id, f"Error fetching categories: {str(e)}")
+
+    async def _handle_general_question(self, messages, context_id, task_id, message_text):
+        context = ""
+        if context_id in self.price_history:
+            recent = self.price_history[context_id][-3:]
+            context = ", ".join([f"{p['coin']}: {p['currency'].upper()} {p['price']}" for p in recent])
+
+        response_text = await self._compose_llm_response(message_text, "General crypto knowledge request.", context)
+        response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=response_text)], taskId=task_id)
 
         return TaskResult(
             id=task_id,
             contextId=context_id,
-            status=TaskStatus(state="completed", message=response_message),
+            status=TaskStatus(state="completed"),
             artifacts=[],
             history=messages + [response_message]
         )
 
-    async def _generate_llm_response(
-        self, original_message: str, coin_id: str, 
-        price: float, currency: str, context_id: str
-    ) -> str:
-        """Generate natural language response using LLM"""
-        
-        try:
-            prompt = f"""User asked: "{original_message}"
-            
-Coin: {coin_id}
-Price: {currency.upper()} {price:,.2f}
-
-Generate a natural, conversational response providing this price information. Be helpful and concise."""
-
-            response = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": "You are a helpful cryptocurrency assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=200
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            print(f"LLM response generation error: {e}")
-            return f"The current price of {coin_id.title()} is {currency.upper()} {price:,.2f}"
-
-    async def _generate_comparison_response(
-        self, prices: Dict[str, float], currency: str, context_id: str
-    ) -> str:
-        """Generate comparison response using LLM"""
-        
-        try:
-            price_list = "\n".join([
-                f"- {coin.title()}: {currency.upper()} {price:,.2f}" 
-                for coin, price in prices.items()
-            ])
-            
-            prompt = f"""Compare these cryptocurrency prices:
-{price_list}
-
-Provide insights about the price differences and any notable observations."""
-
-            response = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": "You are a cryptocurrency market analyst."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=300
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            print(f"Comparison generation error: {e}")
-            result = "Price Comparison:\n"
-            for coin, price in prices.items():
-                result += f"- {coin.title()}: {currency.upper()} {price:,.2f}\n"
-            return result
-
-    def _create_clarification_response(
-        self, messages: List[A2AMessage], context_id: str, 
-        task_id: str, intent_data: Dict
-    ) -> TaskResult:
-        """Create response asking for clarification"""
-        
-        response_text = (
-            "I couldn't identify a specific cryptocurrency. "
-            "I can help you with prices for coins like Bitcoin (BTC), "
-            "Ethereum (ETH), Solana (SOL), Cardano (ADA), and many others. "
-            "Which coin would you like to know about?"
+    
+    # Utility Methods
+    
+    def _create_clarification_response(self, messages, context_id, task_id):
+        text = (
+            "I couldn't identify a specific cryptocurrency or understand your request. "
+            "Please mention a coin like Bitcoin (BTC), Ethereum (ETH), Solana (SOL), etc., "
+            "or ask about market data, categories, or historical prices."
         )
-        
-        response_message = A2AMessage(
-            role="agent",
-            parts=[MessagePart(kind="text", text=response_text)],
-            taskId=task_id
-        )
-
+        response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=text)], taskId=task_id)
         return TaskResult(
             id=task_id,
             contextId=context_id,
-            status=TaskStatus(state="input-required", message=response_message),
+            status=TaskStatus(state="input-required"),
             artifacts=[],
             history=messages + [response_message]
         )
 
-    def _parse_message(self, text: str) -> tuple[Optional[str], str]:
-        """Parse message to extract coin ID and currency (fallback method)"""
-        text_lower = text.lower()
-
-        coin_map = {
-            "bitcoin": "bitcoin", "btc": "bitcoin",
-            "ethereum": "ethereum", "eth": "ethereum",
-            "solana": "solana", "sol": "solana",
-            "cardano": "cardano", "ada": "cardano",
-            "ripple": "ripple", "xrp": "ripple",
-            "polkadot": "polkadot", "dot": "polkadot",
-            "dogecoin": "dogecoin", "doge": "dogecoin",
-            "avalanche": "avalanche", "avax": "avalanche",
-            "chainlink": "chainlink", "link": "chainlink",
-            "polygon": "matic-network", "matic": "matic-network",
-            "litecoin": "litecoin", "ltc": "litecoin",
-            "binance": "binancecoin", "bnb": "binancecoin",
-            "shiba": "shiba-inu", "shib": "shiba-inu",
-            "uniswap": "uniswap", "uni": "uniswap",
-        }
-
-        coin_id = None
-        for key, value in coin_map.items():
-            if key in text_lower:
-                coin_id = value
-                break
-
-        currency = "usd"
-        currencies = ["usd", "eur", "gbp", "jpy", "cad", "aud"]
-        for curr in currencies:
-            if curr in text_lower:
-                currency = curr
-                break
-
-        return coin_id, currency
-
-    def _extract_multiple_coins(self, text: str) -> List[str]:
-        """Extract multiple coin IDs from text"""
-        text_lower = text.lower()
-        coin_map = {
-            "bitcoin": "bitcoin", "btc": "bitcoin",
-            "ethereum": "ethereum", "eth": "ethereum",
-            "solana": "solana", "sol": "solana",
-            "cardano": "cardano", "ada": "cardano",
-        }
-        
-        found_coins = []
-        for key, value in coin_map.items():
-            if key in text_lower and value not in found_coins:
-                found_coins.append(value)
-        
-        return found_coins
-
-    async def get_price(self, coin_id: str, currency: str = "usd") -> float:
-        """Fetch the current price of a coin from CoinGecko"""
-        try:
-            price_data = await self.client.simple.price.get(
-                vs_currencies=currency,
-                ids=coin_id,
-            )
-            
-            if coin_id in price_data and hasattr(price_data[coin_id], currency):
-                return getattr(price_data[coin_id], currency)
-            
-            return None
-        except Exception as e:
-            print(f"Error fetching price: {e}")
-            return None
-
-    async def cleanup(self):
-        """Cleanup resources"""
-        self.price_history.clear()
-        self.conversation_history.clear()
-        if hasattr(self.client, 'close'):
-            await self.client.close()
+    def _error_result(self, messages, context_id, task_id, error_msg):
+        response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=error_msg)], taskId=task_id)
+        return TaskResult(
+            id=task_id,
+            contextId=context_id,
+            status=TaskStatus(state="failed"),
+            artifacts=[],
+            history=messages + [response_message]
+        )

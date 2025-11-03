@@ -1,2 +1,10 @@
 .env
 /agents/__pycache__/
+__pycache__/
+/llm/__pycache__/
+/llm/llm_service.pyc
+/models/__pycache__/
+agents/workflow2.json
+agent_works.py
+llm/works.py
+/core/__pycache__/

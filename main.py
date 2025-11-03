@@ -1,45 +1,12 @@
-# main.py
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from contextlib import asynccontextmanager
-from dotenv import load_dotenv
-import os
 import traceback
+import uvicorn
 
-from models.a2a import JSONRPCRequest, JSONRPCResponse, TaskResult, TaskStatus, Artifact, MessagePart, A2AMessage
-from agents.crypto_agent import CryptoAgent
+from core.config import settings
+from core.startup import lifespan
+from models.a2a import JSONRPCRequest, JSONRPCResponse
 
-load_dotenv()
-
-# Initialize crypto agent
-crypto_agent = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup and shutdown"""
-    global crypto_agent
-    
-    # Startup: Initialize the crypto agent
-    print("🚀 Initializing Crypto Agent...")
-    crypto_agent = CryptoAgent(
-        demo_api_key=os.getenv("COINGECKO_DEMO_API_KEY"),
-        pro_api_key=os.getenv("COINGECKO_PRO_API_KEY"),
-        environment=os.getenv("COINGECKO_ENVIRONMENT", "demo"),
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-    )
-    print("✅ Crypto Agent initialized")
-    
-    # Verify API keys
-    print(f"🔑 COINGECKO_DEMO_API_KEY: {'✓' if os.getenv('COINGECKO_DEMO_API_KEY') else '✗'}")
-    print(f"🔑 GROQ_API_KEY: {'✓' if os.getenv('GROQ_API_KEY') else '✗'}")
-    
-    yield
-    
-    # Shutdown: Cleanup
-    print("🛑 Shutting down Crypto Agent...")
-    if crypto_agent:
-        await crypto_agent.cleanup()
-    print("✅ Cleanup complete")
 
 app = FastAPI(
     title="Crypto Agent A2A",
@@ -50,133 +17,63 @@ app = FastAPI(
 
 @app.post("/a2a/price")
 async def a2a_endpoint(request: Request):
-    """Main A2A endpoint for crypto agent"""
-    body = None
-    request_id = None
-    
+    """Main A2A endpoint for crypto agent."""
     try:
-        # Parse request body
         body = await request.json()
         request_id = body.get("id")
-        
-        print(f"\n📨 Received request:")
-        print(f"   Method: {body.get('method')}")
-        print(f"   ID: {request_id}")
-        print(f"   Body keys: {list(body.keys())}")
-        
-        # Validate JSON-RPC request
+        method = body.get("method")
+
+        print(f"\n📨 Received {method} request (id={request_id})")
+
+        # Validate JSON-RPC structure
         if body.get("jsonrpc") != "2.0":
-            print("❌ Invalid jsonrpc version")
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -32600,
-                        "message": "Invalid Request: jsonrpc must be '2.0'"
-                    }
-                }
-            )
-        
+            raise ValueError("Invalid Request: jsonrpc must be '2.0'")
         if "id" not in body:
-            print("❌ Missing id field")
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {
-                        "code": -32600,
-                        "message": "Invalid Request: id is required"
-                    }
-                }
-            )
-        
-        # Parse into Pydantic model
-        try:
-            rpc_request = JSONRPCRequest(**body)
-        except Exception as e:
-            print(f"❌ Failed to parse request: {e}")
-            traceback.print_exc()
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -32602,
-                        "message": f"Invalid params: {str(e)}"
-                    }
-                }
-            )
-        
-        # Extract messages based on method
-        messages = []
-        context_id = None
-        task_id = None
-        config = None
-        
-        print(f"   Processing method: {rpc_request.method}")
-        
+            raise ValueError("Invalid Request: id is required")
+
+        # Parse request
+        rpc_request = JSONRPCRequest(**body)
+        messages, config, context_id, task_id = [], None, None, None
+
+        # Handle A2A methods
         if rpc_request.method == "message/send":
-            if not hasattr(rpc_request.params, 'message'):
+            if not hasattr(rpc_request.params, "message"):
                 raise ValueError("message/send requires 'message' in params")
             messages = [rpc_request.params.message]
-            config = getattr(rpc_request.params, 'configuration', None)
-            print(f"   Message text: {messages[0].parts[0].text if messages[0].parts else 'N/A'}")
-            
+            config = getattr(rpc_request.params, "configuration", None)
         elif rpc_request.method == "execute":
-            if not hasattr(rpc_request.params, 'messages'):
+            if not hasattr(rpc_request.params, "messages"):
                 raise ValueError("execute requires 'messages' in params")
             messages = rpc_request.params.messages
-            context_id = getattr(rpc_request.params, 'contextId', None)
-            task_id = getattr(rpc_request.params, 'taskId', None)
-            print(f"   Messages count: {len(messages)}")
-            print(f"   Context ID: {context_id}")
-            print(f"   Task ID: {task_id}")
+            context_id = getattr(rpc_request.params, "contextId", None)
+            task_id = getattr(rpc_request.params, "taskId", None)
         else:
             raise ValueError(f"Unknown method: {rpc_request.method}")
-        
-        # Validate we have messages
+
         if not messages:
             raise ValueError("No messages provided")
-        
-        print(f"🤖 Processing with crypto agent...")
-        
-        # Process with crypto agent
-        result = await crypto_agent.process_messages(
+
+        print(f"🤖 Processing {len(messages)} message(s) with crypto agent...")
+        result = await request.app.state.crypto_agent.process_messages(
             messages=messages,
             context_id=context_id,
             task_id=task_id,
             config=config
         )
-        
-        print(f"✅ Agent processing complete")
-        print(f"   Result status: {result.status.state}")
-        
-        # Build response
-        response = JSONRPCResponse(
-            id=rpc_request.id,
-            result=result
-        )
-        
-        response_dict = response.model_dump()
-        print(f"📤 Sending response (truncated): {str(response_dict)[:200]}...")
-        
-        return response_dict
-        
+
+        response = JSONRPCResponse(id=rpc_request.id, result=result)
+        print("Agent processing complete")
+
+        return response.model_dump()
+
     except Exception as e:
         error_msg = str(e)
-        print(f"\n❌ Error processing request:")
-        print(f"   Error: {error_msg}")
         traceback.print_exc()
-        
         return JSONResponse(
             status_code=500,
             content={
                 "jsonrpc": "2.0",
-                "id": request_id,
+                "id": body.get("id") if "body" in locals() else None,
                 "error": {
                     "code": -32603,
                     "message": f"Internal error: {error_msg}"
@@ -185,8 +82,9 @@ async def a2a_endpoint(request: Request):
         )
 
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """Health check endpoint"""
+    crypto_agent = getattr(request.app.state, "crypto_agent", None)
     return {
         "status": "healthy",
         "agent": "crypto",
@@ -195,7 +93,6 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "name": "Crypto Agent A2A",
         "version": "1.0.0",
@@ -206,7 +103,5 @@ async def root():
     }
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 5001))
-    print(f"🚀 Starting server on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print(f"Starting server on port {settings.PORT}")
+    uvicorn.run("main:app", host="0.0.0.0", port=settings.PORT, reload=True)

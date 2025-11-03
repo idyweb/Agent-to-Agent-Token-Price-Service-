@@ -4,16 +4,21 @@ from datetime import datetime
 from uuid import uuid4
 
 class MessagePart(BaseModel):
-    kind: Literal["text", "data", "file", "image", "artifact"]  # Added more types
+    kind: Literal["text", "data", "file", "image", "artifact"]
     text: Optional[str] = None
-    data: Optional[Union[Dict[str, Any], List[Any], str, int, float, bool]] = None  # Accept any type
+    data: Optional[Union[Dict[str, Any], List[Any], str, int, float, bool]] = None
     file_url: Optional[str] = None
-    url: Optional[str] = None  # Some platforms use 'url' instead of 'file_url'
-    mimeType: Optional[str] = None  # Some platforms include mimeType
-    name: Optional[str] = None  # Some platforms include name
+    url: Optional[str] = None
+    mimeType: Optional[str] = None
+    name: Optional[str] = None
     
     class Config:
-        extra = "allow"  # Allow extra fields
+        extra = "allow"
+
+class MessageMetaData(BaseModel):
+    telex_user_id: Optional[str] = None
+    telex_channel_id: Optional[str] = None
+    org_id: Optional[str] = None
 
 class A2AMessage(BaseModel):
     kind: Literal["message"] = "message"
@@ -21,8 +26,9 @@ class A2AMessage(BaseModel):
     parts: List[MessagePart]
     messageId: Optional[str] = Field(default_factory=lambda: str(uuid4()))
     taskId: Optional[str] = None
-    contextId: Optional[str] = None  # Added this
-    metadata: Optional[Dict[str, Any]] = None
+    contextId: Optional[str] = None
+    # metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[MessageMetaData] = None
     
     class Config:
         extra = "allow"
@@ -91,7 +97,7 @@ class Artifact(BaseModel):
 
 class TaskResult(BaseModel):
     id: str
-    contextId: Optional[str] = None  # Made optional
+    contextId: Optional[str] = None
     status: TaskStatus
     artifacts: List[Artifact] = []
     history: List[A2AMessage] = []
