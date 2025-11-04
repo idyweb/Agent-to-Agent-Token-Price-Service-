@@ -1,0 +1,6 @@
+coingecko_sdk==1.11.1
+fastapi==0.121.0
+groq==0.33.0
+pydantic==2.12.3
+python-dotenv==1.2.1
+uvicorn==0.38.0
